@@ -1,0 +1,1069 @@
+#!/usr/bin/env python3
+"""imgview - image gallery for a kitty-graphics terminal pane.
+
+  imgview [DIR ...]                  gallery of image files under DIRs (default ~/claude-images)
+  imgview --pointer FILE --session ID
+                                     image-log mode, started by the image-log mod: a gallery of
+                                     that one session's images from ~/.cache/claude-images/log.jsonl;
+                                     when FILE (the path Claude last showed) changes, it jumps there
+  imgview --pointer FILE             mirror the single image FILE names
+
+Views (click the tabs, or press 1 2 3; v cycles)
+  grid      cards; click one to open it
+  sidebar   thumbnails on the left, the picked image large on the right
+  single    one image, a back button, and a clickable filmstrip
+
+Keys
+  arrows / hjkl     move              enter    open / back
+  esc               back
+  o                 open in app       q        quit
+  s                 newest first / oldest first
+  y                 copy the image's path      t   thumbnail size
+  [ ]               narrower / wider sidebar   ?   all keys
+  + - 0             zoom in / out / fit (single view; also the wheel, and drag or arrows to pan)
+  mouse             click to pick or open, wheel to move
+"""
+import base64, fcntl, hashlib, io, json, os, re, select, signal, struct, subprocess, sys, termios, time, tty
+
+try:
+    from PIL import Image, ImageChops, ImageDraw
+except ImportError:
+    sys.stderr.write("imgview needs Pillow:  python3 -m pip install --user Pillow\n")
+    sys.exit(1)
+
+EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
+LOG = os.path.expanduser("~/.cache/claude-images/log.jsonl")
+RENDER = os.path.expanduser("~/.cache/claude-images/render")
+PREFS = os.path.expanduser("~/.cache/claude-images/imgview.json")
+THUMBS = os.path.expanduser("~/.cache/claude-images/thumbs")
+THUMB_MAX = 640           # boxes up to this many px draw from a small saved thumbnail
+MODES = ("grid", "sidebar", "single")
+REPLY = re.compile(r"\x1b_G([^;\x1b]*);([^\x1b]*)\x1b\\")   # kitty's reply: ESC _G keys ; message ESC \
+MOUSE = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([mM])")
+
+# ── arguments ────────────────────────────────────────────────────────────────
+ARGS, POINTER, SESSION = sys.argv[1:], None, None
+while ARGS[:1] in (["--pointer"], ["--session"]) and len(ARGS) > 1:
+    if ARGS[0] == "--pointer":
+        POINTER = os.path.expanduser(ARGS[1])
+    else:
+        SESSION = ARGS[1]
+    ARGS = ARGS[2:]
+DIRS = [os.path.abspath(os.path.expanduser(d)) for d in (ARGS or ["~/claude-images"])]
+
+# ── design tokens ────────────────────────────────────────────────────────────
+# Only the terminal's own palette, so kitty's theme (through herdr) decides every
+# colour: one accent (theme blue), dimmed foreground for secondary text, the
+# theme's "bright black" for hairlines and borders, theme yellow for warnings.
+ACCENT, MUTED, FAINT, WARN = "\033[34m", "\033[2m", "\033[90m", "\033[33m"
+BOLD, RESET = "\033[1m", "\033[0m"
+MARGIN, GUTTER = 2, 2          # cells: outer side margin, gap between cards
+CARD_SIZES = {"small": 20, "medium": 26, "large": 34}   # narrowest card, per thumbnail size
+# Send pictures afresh on every draw. Keeping them in the terminal and only placing them again
+# does not hold up: clearing the screen's placements makes kitty (and herdr) free the pictures
+# too, so later placements find nothing. IMGVIEW_SIMPLE=0 turns the kept-picture path back on.
+SIMPLE = os.environ.get("IMGVIEW_SIMPLE", "1") != "0"
+THUMB_RATIO = 10 / 16           # thumbnail box height : width, in pixels
+
+out = sys.stdout
+DEBUG_LOG = os.environ.get("IMGVIEW_DEBUG")      # a file path: log draws and terminal replies
+
+
+def debug(*parts):
+    with open(DEBUG_LOG, "a") as f:
+        f.write(f"{time.time():.2f} " + " ".join(str(p) for p in parts) + "\n")
+
+
+def w(s):
+    out.write(s)
+
+
+def at(row, col, s=""):
+    w(f"\033[{row};{col}H{s}")
+
+
+def term_size():
+    rows, cols, xpx, ypx = struct.unpack("HHHH", fcntl.ioctl(1, termios.TIOCGWINSZ, b"\0" * 8))
+    cw = xpx / cols if xpx and cols else 10.0
+    ch = ypx / rows if ypx and rows else 20.0
+    return rows, cols, cw, ch
+
+
+def trunc(s, n, middle=True):
+    if n <= 1 or len(s) <= n:
+        return s[:max(n, 0)]
+    if not middle:
+        return s[: n - 1] + "…"
+    head = (n - 1) // 2
+    return s[:head] + "…" + s[len(s) - (n - 1 - head):]
+
+
+def ago(t):
+    s = max(0, int(time.time() - t))
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= size:
+            return f"{s // size}{unit} ago"
+    return "just now"
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+# ── sources ──────────────────────────────────────────────────────────────────
+class Item:
+    __slots__ = ("path", "time", "meta")
+
+    def __init__(self, path, t, meta=None):
+        self.path, self.time, self.meta = path, t, meta or {}
+
+
+def read_pointer():
+    try:
+        with open(POINTER) as f:
+            return f.read().strip()
+    except (OSError, TypeError):
+        return ""
+
+
+_log_cache = {}
+
+
+def scan_log(all_sessions):
+    """Parsed only when the log changed (or every 10 s, to notice deleted files)."""
+    try:
+        st = os.stat(LOG)
+    except OSError:
+        return []
+    sig = (st.st_size, st.st_mtime, all_sessions, int(time.time() // 10))
+    if _log_cache.get("sig") == sig:
+        return list(_log_cache["items"])
+    items = _scan_log(all_sessions)
+    _log_cache.update(sig=sig, items=items)
+    return list(items)
+
+
+def _scan_log(all_sessions):
+    latest = {}
+    try:
+        with open(LOG) as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    for line in lines:
+        try:
+            x = json.loads(line)
+        except ValueError:
+            continue
+        if not all_sessions and x.get("sessionId") != SESSION:
+            continue
+        path = x.get("path")
+        if x.get("kind") == "inline":
+            # Returned images exist on disk only once decoded into the render cache.
+            ext = x.get("mediaType", "image/png").split("/")[-1].replace("jpeg", "jpg")
+            path = os.path.join(RENDER, f"{x.get('id')}.{ext}")
+        if path and os.path.isfile(path):
+            latest[path] = Item(path, x.get("time", 0) / 1000, x)
+    return sorted(latest.values(), key=lambda i: i.time)
+
+
+def scan_dirs():
+    items = []
+    for d in DIRS:
+        os.makedirs(d, exist_ok=True)
+        for root, _, names in os.walk(d):
+            for n in names:
+                if os.path.splitext(n)[1].lower() in EXTS:
+                    p = os.path.join(root, n)
+                    try:
+                        items.append(Item(p, os.path.getmtime(p)))
+                    except OSError:
+                        pass
+    return sorted(items, key=lambda i: i.time)
+
+
+def scan(all_sessions):
+    if SESSION:
+        return scan_log(all_sessions)
+    if POINTER:
+        p = read_pointer()
+        return [Item(p, os.path.getmtime(p))] if p and os.path.isfile(p) else []
+    return scan_dirs()
+
+
+# ── pictures ─────────────────────────────────────────────────────────────────
+_info, _png = {}, {}
+_next_id = [1]
+
+
+def info(path):
+    """(width, height, bytes) of an image, cached per file version."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (path, st.st_mtime)
+    if key not in _info:
+        try:
+            with Image.open(path) as im:
+                _info[key] = (im.width, im.height, st.st_size)
+        except Exception:
+            _info[key] = None
+    return _info[key]
+
+
+class Pic:
+    """One fitted picture: its PNG, pixel size, and the kitty image id it is kept under."""
+    __slots__ = ("data", "size", "id", "sent")
+
+    def __init__(self, data, size):
+        self.data, self.size, self.sent = data, size, False
+        self.id, _next_id[0] = _next_id[0], _next_id[0] % 4_000_000 + 1
+
+    @property
+    def cost(self):
+        return self.size[0] * self.size[1] * 4      # what the terminal holds for it, decoded
+
+
+# Pictures the terminal keeps for us, least recently placed first. kitty deletes the oldest
+# stored pictures once they pass its quota (320 MB by default) and placing one it deleted shows
+# nothing, so we stay well under that and free pictures ourselves.
+SENT_BUDGET = 150 * 1024 * 1024
+_sent = {}
+
+
+def forget(pic):
+    """Free the terminal's copy of a picture; it is sent again if needed."""
+    if pic and pic.sent:
+        w(f"\033_Ga=d,d=I,i={pic.id},q=2\033\\")
+        pic.sent = False
+    if pic:
+        _sent.pop(pic.id, None)
+
+
+def place(pic):
+    """Show a kept picture at the cursor, sending it first if the terminal does not hold it."""
+    if not pic.sent:
+        total = sum(p.cost for p in _sent.values())
+        while _sent and total + pic.cost > SENT_BUDGET:
+            oldest = next(iter(_sent.values()))
+            total -= oldest.cost
+            forget(oldest)
+        transmit(f"a=t,f=100,i={pic.id},q=2", pic.data)
+        pic.sent = True
+    _sent.pop(pic.id, None)
+    _sent[pic.id] = pic
+    w(f"\033_Ga=p,i={pic.id},C=1,q=1\033\\")       # q=1: the terminal answers only failures
+
+
+def source_image(path, box_w, box_h):
+    """The image to fit into a box: for small boxes a saved thumbnail (made once per file
+    version, JPEGs decoded straight at reduced size), else the original."""
+    if box_w > THUMB_MAX or box_h > THUMB_MAX:
+        return Image.open(path)
+    st = os.stat(path)
+    name = hashlib.sha1(f"{path}|{st.st_mtime}|{st.st_size}".encode()).hexdigest() + ".png"
+    cached = os.path.join(THUMBS, name)
+    if os.path.isfile(cached):
+        return Image.open(cached)
+    im = Image.open(path)
+    if im.format == "JPEG":
+        im.draft("RGB", (THUMB_MAX, THUMB_MAX))
+    im.seek(0)
+    im = im.convert("RGBA")
+    im.thumbnail((THUMB_MAX, THUMB_MAX), Image.LANCZOS, reducing_gap=3.0)
+    try:
+        os.makedirs(THUMBS, exist_ok=True)
+        tmp = f"{cached}.{os.getpid()}.tmp"
+        im.save(tmp, "PNG", compress_level=3)
+        os.replace(tmp, cached)
+    except OSError:
+        pass
+    return im
+
+
+def picture(path, box_w, box_h, radius=0):
+    """The image fitted into box_w x box_h px, corners rounded by `radius` px; cached."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    key = (path, mtime, box_w, box_h, radius)
+    if key not in _png:
+        try:
+            im = source_image(path, box_w, box_h)
+            im.seek(0)
+            im = im.convert("RGBA")
+            scale = min(box_w / im.width, box_h / im.height)
+            size = (max(1, int(im.width * scale)), max(1, int(im.height * scale)))
+            im = im.resize(size, Image.LANCZOS)
+            if radius:
+                mask = Image.new("L", size, 0)
+                ImageDraw.Draw(mask).rounded_rectangle((0, 0, size[0] - 1, size[1] - 1), radius, fill=255)
+                im.putalpha(ImageChops.multiply(im.getchannel("A"), mask))
+            buf = io.BytesIO()
+            im.save(buf, "PNG")
+            _png[key] = Pic(base64.b64encode(buf.getvalue()).decode(), size)
+        except Exception:
+            _png[key] = None
+        if len(_png) > 200:
+            forget(_png.pop(next(iter(_png))))   # free the terminal's copy too
+    return _png[key]
+
+
+def transmit(control, data):
+    chunks = [data[i:i + 4096] for i in range(0, len(data), 4096)] or [""]
+    for i, c in enumerate(chunks):
+        m = 1 if i < len(chunks) - 1 else 0
+        w(f"\033_G{control + ',' if i == 0 else ''}m={m};{c}\033\\")
+
+
+def draw_picture(path, row, col, cols, rows, cw, ch, radius=0):
+    """Draw the image centred in a box of cells at (row, col). False if it cannot be read.
+
+    Each fitted picture is sent to the terminal once and kept under an id; later draws
+    only place it again, so redraws and scrolling cost almost nothing.
+    """
+    pic = picture(path, int(cols * cw), int(rows * ch), radius)
+    if not pic:
+        return False
+    pw, ph = pic.size
+    used_c, used_r = -(-pw // int(cw)), -(-ph // int(ch))
+    at(row + max(0, (rows - used_r) // 2), col + max(0, (cols - used_c) // 2))
+    if SIMPLE:
+        transmit("a=T,f=100,q=2,C=1", pic.data)
+        return True
+    place(pic)
+    return True
+
+
+_full = {}
+
+
+def full_image(path):
+    """The whole image decoded once, for zooming; only the last two are kept."""
+    key = (path, os.path.getmtime(path))
+    if key not in _full:
+        im = Image.open(path)
+        im.seek(0)
+        _full[key] = im.convert("RGBA")
+        while len(_full) > 2:
+            _full.pop(next(iter(_full)))
+    return _full[key]
+
+
+class View:
+    """Where a zoomed image sits: scale (screen px per image px), the image point at the
+    centre of the box, and the box it was fitted to."""
+    __slots__ = ("scale", "cx", "cy", "box_w", "box_h", "w", "h")
+
+
+def zoom_view(path, box_w, box_h, zoom, center):
+    """The view of `path` at `zoom` x fit inside box_w x box_h px, centred on `center`
+    (image px) where the image is bigger than the box, clamped so no gap shows."""
+    im = full_image(path)
+    v = View()
+    v.w, v.h, v.box_w, v.box_h = im.width, im.height, box_w, box_h
+    v.scale = min(box_w / im.width, box_h / im.height) * zoom
+    vw, vh = min(im.width, box_w / v.scale), min(im.height, box_h / v.scale)
+    cx, cy = center if center else (im.width / 2, im.height / 2)
+    v.cx = min(max(cx, vw / 2), im.width - vw / 2)
+    v.cy = min(max(cy, vh / 2), im.height - vh / 2)
+    return v
+
+
+STAGE_ID = 4_100_000     # the single view's picture, replaced in place while panning
+
+
+def render_view(path, v, fast):
+    """PNG of the part of the image `v` shows. `fast`: quick resampling and light compression,
+    for frames shown only while the mouse moves (not cached)."""
+    vw, vh = min(v.w, v.box_w / v.scale), min(v.h, v.box_h / v.scale)
+    x0, y0 = v.cx - vw / 2, v.cy - vh / 2
+    key = (path, os.path.getmtime(path), "zoom", round(x0), round(y0), round(vw), round(vh), v.box_w, v.box_h)
+    if not fast and key in _png:
+        return _png[key]
+    size = (max(1, round(vw * v.scale)), max(1, round(vh * v.scale)))
+    crop = full_image(path).crop((round(x0), round(y0), round(x0 + vw), round(y0 + vh)))
+    if fast:
+        # Half the pixels each way while the mouse moves; the terminal stretches it to the
+        # full box (c=, r= at placement) and the release redraws it crisp.
+        half = (max(1, size[0] // 2), max(1, size[1] // 2))
+        crop = crop.resize(half, Image.NEAREST if v.scale < 0.5 else Image.BILINEAR)
+        buf = io.BytesIO()
+        crop.save(buf, "PNG", compress_level=1)
+        pic = Pic(base64.b64encode(buf.getvalue()).decode(), size)   # size: the box it fills
+        return pic
+    else:
+        crop = crop.resize(size, Image.LANCZOS if v.scale < 1 else Image.BICUBIC, reducing_gap=3.0)
+    buf = io.BytesIO()
+    crop.save(buf, "PNG", compress_level=1 if fast else 6)
+    pic = Pic(base64.b64encode(buf.getvalue()).decode(), size)
+    if not fast:
+        _png[key] = pic
+        if len(_png) > 200:
+            forget(_png.pop(next(iter(_png))))
+    return pic
+
+
+def draw_zoomed(path, row, col, cols, rows, cw, ch, v, fast=False):
+    """Draw the part of the image `v` shows, centred in the box of cells."""
+    pic = render_view(path, v, fast)
+    pw, ph = pic.size
+    used_c, used_r = -(-pw // int(cw)), -(-ph // int(ch))
+    top, left = row + max(0, (rows - used_r) // 2), col + max(0, (cols - used_c) // 2)
+    at(top, left)
+    if SIMPLE or fast:
+        # Under a fixed id, so a later frame can replace this one without clearing the screen.
+        w(f"\033_Ga=d,d=I,i={STAGE_ID},q=2\033\\")
+        at(top, left)
+        stretch = f",c={used_c},r={used_r}" if fast else ""
+        transmit(f"a=T,f=100,i={STAGE_ID},q=2,C=1{stretch}", pic.data)
+    else:
+        place(pic)
+    return top, left, pw, ph
+
+
+def clear_pictures(forget=False):
+    """Remove what is on screen; with `forget`, also the pictures the terminal keeps."""
+    if forget or SIMPLE:
+        w("\033_Ga=d,d=A,q=2\033\\")
+        for pic in _png.values():
+            if pic:
+                pic.sent = False
+        _sent.clear()
+    else:
+        w("\033_Ga=d,d=a,q=2\033\\")
+
+
+def copy_text(text):
+    """Put text on the clipboard: a desktop clipboard tool if there is one, else OSC 52."""
+    for argv in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "-ib"], ["pbcopy"]):
+        try:
+            subprocess.run(argv, input=text.encode(), check=True, timeout=2,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        except (OSError, subprocess.SubprocessError):
+            continue
+    w(f"\033]52;c;{base64.b64encode(text.encode()).decode()}\a")
+
+
+# ── chrome ───────────────────────────────────────────────────────────────────
+def card(row, col, width, height, selected):
+    color = ACCENT if selected else FAINT
+    inner = "─" * (width - 2)
+    at(row, col, f"{color}╭{inner}╮")
+    for r in range(row + 1, row + height - 1):
+        at(r, col, f"│{RESET}")
+        at(r, col + width - 1, f"{color}│")
+    at(row + height - 1, col, f"╰{inner}╯{RESET}")
+
+
+def keycaps(pairs):
+    return "   ".join(f"{ACCENT}{k}{RESET} {MUTED}{label}{RESET}" for k, label in pairs)
+
+
+def visible_len(pairs):
+    return sum(len(k) + 1 + len(label) for k, label in pairs) + 3 * (len(pairs) - 1)
+
+
+def header(cols, title, detail, right=""):
+    at(1, MARGIN + 1, f"{BOLD}{title}{RESET}  {MUTED}{detail}{RESET}")
+    if right:
+        at(1, max(MARGIN + 1, cols - MARGIN - len(right) + 1), f"{MUTED}{right}{RESET}")
+    at(2, MARGIN + 1, f"{FAINT}{'─' * (cols - 2 * MARGIN)}{RESET}")
+
+
+FLASH = {"text": "", "until": 0.0}
+
+
+def footer(rows, cols, pairs, right=""):
+    if FLASH["text"] and time.time() < FLASH["until"]:
+        right = FLASH["text"]
+    at(rows - 1, MARGIN + 1, f"{FAINT}{'─' * (cols - 2 * MARGIN)}{RESET}")
+    while pairs and visible_len(pairs) > cols - 2 * MARGIN - len(right) - 2:
+        pairs = pairs[:-1]
+    at(rows, MARGIN + 1, keycaps(pairs))
+    if right:
+        at(rows, cols - MARGIN - len(right) + 1, f"{MUTED}{right}{RESET}")
+
+
+def origin(item):
+    """Who the image came from: you (pasted or dropped into the prompt) or Claude."""
+    return "You" if item.meta.get("via") == "sent" else "Claude"
+
+
+def origin_tag(item):
+    """The origin word styled: yours stands out in bold, Claude's stays quiet."""
+    return f"{BOLD}You{RESET}" if origin(item) == "You" else f"{MUTED}Claude{RESET}"
+
+
+def describe(item):
+    """The quiet line of facts under a picture: dims · size · how it came · age."""
+    i = info(item.path)
+    parts = [f"{i[0]}×{i[1]}", human_size(i[2])] if i else []
+    m = item.meta
+    if m.get("via") == "sent":
+        parts.insert(0, "sent by you")
+    elif m.get("tool"):
+        how = {"write": "written", "bash": "command", "read": "read", "returned": "returned"}.get(m.get("via"), m.get("via", ""))
+        parts.append(f"{how} by {m['tool'].replace('mcp__', '')}")
+    if m.get("agentId"):
+        parts.append(f"agent {m['agentId'][:8]}")
+    parts.append(ago(item.time))
+    return " · ".join(parts)
+
+
+# ── the viewer ───────────────────────────────────────────────────────────────
+def load_prefs():
+    try:
+        with open(PREFS) as f:
+            prefs = json.load(f)
+    except (OSError, ValueError):
+        prefs = {}
+    if prefs.get("mode") not in ("grid", "sidebar"):
+        prefs["mode"] = "grid"
+    prefs.setdefault("newestFirst", True)
+    if prefs.get("thumbSize") not in CARD_SIZES:
+        prefs["thumbSize"] = "medium"
+    if not isinstance(prefs.get("sidebarWidth"), int):
+        prefs["sidebarWidth"] = 0          # 0: a quarter of the pane
+    return prefs
+
+
+def save_prefs(**changes):
+    prefs = {**load_prefs(), **changes}
+    try:
+        os.makedirs(os.path.dirname(PREFS), exist_ok=True)
+        with open(PREFS, "w") as f:
+            json.dump(prefs, f)
+    except OSError:
+        pass
+
+
+class Viewer:
+    def __init__(self):
+        prefs = load_prefs()
+        self.all_sessions = False                 # the gallery shows its own session only
+        self.newest_first = prefs["newestFirst"]
+        self.items = self.ordered(scan(self.all_sessions))
+        self.idx = self.newest()
+        self.home = prefs["mode"]                 # the browsing view Back returns to
+        self.thumb_size = prefs["thumbSize"]
+        self.side_w = prefs["sidebarWidth"]
+        self.help = False
+        self.quitting = False
+        self.zoom, self.center = 1.0, None        # single view: x fit, image point at centre
+        self.stage = None                         # last single-view geometry, for the mouse
+        self.drag = None
+        self.stage_dirty = False                  # only the zoomed picture moved
+        self.last_draw = 0.0
+        self.mode = self.home if (SESSION or not POINTER) else "single"
+        self.follow = True
+        self.pointer = read_pointer() if POINTER else ""
+        self.dirty = True
+        self.page_size = 1
+        self.hits = []                            # (row1, col1, row2, col2, action) from the last draw
+
+    @property
+    def paths(self):
+        return [i.path for i in self.items]
+
+    def ordered(self, items):
+        """Sources give oldest first; the list is shown in the chosen order."""
+        return list(reversed(items)) if self.newest_first else items
+
+    def newest(self):
+        return 0 if self.newest_first else len(self.items) - 1
+
+    def rescan(self):
+        old = self.paths
+        cur = old[self.idx] if 0 <= self.idx < len(old) else None
+        self.items = self.ordered(scan(self.all_sessions))
+        paths = self.paths
+        new = [p for p in paths if p not in old]
+        if self.follow and new and old:
+            self.idx = self.newest()
+        elif cur in paths:
+            self.idx = paths.index(cur)
+        else:
+            self.idx = self.newest()
+        if paths != old:
+            self.dirty = True
+        if POINTER and SESSION:
+            ptr = read_pointer()
+            if ptr != self.pointer:
+                self.pointer = ptr
+                if ptr in paths:
+                    self.idx, self.dirty = paths.index(ptr), True
+
+    # actions -----------------------------------------------------------------
+    def set_mode(self, mode):
+        if mode != "single":
+            self.home = mode
+            save_prefs(mode=mode)
+        self.mode = mode
+        self.dirty = True
+
+    def back(self):
+        if self.mode == "single" and self.zoom > 1:
+            self.zoom, self.center, self.dirty = 1.0, None, True
+        elif self.mode == "single":
+            self.set_mode(self.home)
+
+    def zoom_by(self, factor, at_cell=None):
+        """Zoom the single view, keeping the image point under `at_cell` (row, col) still."""
+        st = self.stage
+        if not st:
+            return
+        v, top, left, cw, ch = st["view"], st["top"], st["left"], st["cw"], st["ch"]
+        new_zoom = min(32.0, max(1.0, self.zoom * factor))
+        if new_zoom == self.zoom:
+            return
+        if at_cell:
+            # image point under the cursor now, and its offset from the box centre in px
+            px = (at_cell[1] - left) * cw + cw / 2
+            py = (at_cell[0] - top) * ch + ch / 2
+            dx, dy = px - st["pw"] / 2, py - st["ph"] / 2
+            ix, iy = v.cx + dx / v.scale, v.cy + dy / v.scale
+            new_scale = v.scale * new_zoom / self.zoom
+            self.center = (ix - dx / new_scale, iy - dy / new_scale)
+        else:
+            self.center = (v.cx, v.cy)
+        self.zoom, self.dirty = new_zoom, True
+
+    def pan(self, dx_px, dy_px):
+        """Move the zoomed view by a distance in screen pixels."""
+        st = self.stage
+        if st and self.zoom > 1:
+            v = st["view"]
+            self.center = (v.cx + dx_px / v.scale, v.cy + dy_px / v.scale)
+            if self.drag:
+                self.stage_dirty = True           # cheap frame now, full redraw on release
+            else:
+                self.dirty = True
+
+    def draw_stage(self):
+        """Redraw just the zoomed picture, quickly, leaving the rest of the screen alone."""
+        st = self.stage
+        if not st or self.mode != "single":
+            self.dirty = True
+            return
+        item = self.items[self.idx]
+        v0 = st["view"]
+        v = zoom_view(item.path, v0.box_w, v0.box_h, self.zoom, self.center)
+        self.center = (v.cx, v.cy)
+        w("\033[?2026h")
+        if not SIMPLE:
+            clear_pictures()   # placements only; kept pictures stay with the terminal
+        top, left, pw, ph = draw_zoomed(item.path, st["area_top"], st["area_left"], st["area_cols"],
+                                        st["area_rows"], st["cw"], st["ch"], v, fast=True)
+        st.update(view=v, top=top, left=left, pw=pw, ph=ph)
+        w("\033[?2026l")
+        out.flush()
+
+    def select(self, i, open_it=False):
+        if 0 <= i < len(self.items):
+            if i != self.idx:
+                self.zoom, self.center = 1.0, None
+            self.idx = i
+            self.follow = i == self.newest()
+            if open_it:
+                self.set_mode("single")
+            self.dirty = True
+
+    def hit(self, r1, c1, r2, c2, action):
+        self.hits.append((r1, c1, r2, c2, action))
+
+    def quit(self):
+        self.quitting = True
+
+    def flash(self, text):
+        FLASH["text"], FLASH["until"], self.dirty = text, time.time() + 2.5, True
+
+    def click(self, row, col):
+        for r1, c1, r2, c2, action in reversed(self.hits):
+            if r1 <= row <= r2 and c1 <= col <= c2:
+                action()
+                return
+
+    # drawing -----------------------------------------------------------------
+    def draw(self):
+        rows, cols, cw, ch = term_size()
+        if DEBUG_LOG:
+            debug("draw", self.mode, f"idx={self.idx}", f"sent={len(_sent)}")
+        self.hits = []
+        w("\033[?2026h")            # synchronized update: no flicker where supported
+        clear_pictures()
+        w("\033[2J")
+        try:
+            if self.help:
+                self.draw_help(rows, cols)
+            elif not self.items:
+                self.draw_empty(rows, cols)
+            else:
+                getattr(self, f"draw_{self.mode}")(rows, cols, cw, ch)
+        except Exception as err:     # never crash the pane; say what went wrong instead
+            w("\033[2J")
+            at(2, MARGIN + 1, f"{WARN}Could not draw this view:{RESET} {trunc(str(err), cols - 30, False)}")
+            at(4, MARGIN + 1, f"{MUTED}Press 1 for the grid, r to reload, or q to quit.{RESET}")
+        w("\033[?2026l")
+        out.flush()
+
+    def scope_text(self):
+        if SESSION:
+            return "this session"
+        return "  ".join(os.path.basename(d) or d for d in DIRS) if not POINTER else "Claude"
+
+    def top_bar(self, cols, detail):
+        """Title (or Back) on the left, view tabs on the right, a hairline under both."""
+        col = MARGIN + 1
+        if self.mode == "single" and (SESSION or not POINTER):
+            label = "‹ Back"
+            at(1, col, f"{ACCENT}{BOLD}{label}{RESET}")
+            self.hit(1, col, 1, col + len(label) - 1, self.back)
+            col += len(label) + 3
+            title = trunc(os.path.basename(self.items[self.idx].path), max(8, cols // 3))
+        else:
+            title = "Images"
+        at(1, col, f"{BOLD}{title}{RESET}  {MUTED}{detail}{RESET}")
+        close_col = cols - MARGIN - 1
+        at(1, close_col, f"{MUTED}✕{RESET}")
+        self.hit(1, close_col - 1, 1, close_col + 1, self.quit)
+        if SESSION or not POINTER:
+            tabs, x = [], cols - MARGIN - 3
+            for i, m in reversed(list(enumerate(MODES))):
+                label = f" {i + 1} {m.capitalize()} "
+                x -= len(label)
+                style = f"{ACCENT}{BOLD}\033[4m" if m == self.mode else MUTED
+                tabs.append((x, f"{style}{label}{RESET}"))
+                self.hit(1, x, 1, x + len(label) - 1, lambda m=m: self.set_mode(m))
+                x -= 1
+            for x, text in tabs:
+                at(1, x, text)
+        at(2, MARGIN + 1, f"{FAINT}{'─' * (cols - 2 * MARGIN)}{RESET}")
+
+    HELP = [
+        ("1  2  3", "grid · sidebar · single view"), ("v", "next view"),
+        ("arrows  hjkl", "move"), ("enter", "open · back"), ("esc", "back"),
+        ("home  end", "first · last"), ("s", "newest first / oldest first"),
+        ("t", "thumbnail size"), ("[  ]", "narrower / wider sidebar"),
+        ("+  -  0", "zoom in · out · fit (single view)"), ("wheel  drag", "zoom · pan (single view)"),
+        ("y", "copy the image's path"), ("o", "open in your image app"),
+        ("r", "reload"),
+        ("click  wheel", "pick or open · move"), ("q  ✕", "close the gallery"),
+    ]
+
+    def draw_help(self, rows, cols):
+        header(cols, "Keys", "any key closes")
+        width = max(len(k) for k, _ in self.HELP) + 4
+        top = max(4, (rows - len(self.HELP)) // 2 - 1)
+        left = max(MARGIN + 1, (cols - width - 34) // 2)
+        for i, (k, label) in enumerate(self.HELP):
+            at(top + i, left, f"{ACCENT}{k.rjust(width - 4)}{RESET}    {label}")
+        footer(rows, cols, [("any key", "close")])
+
+    def draw_empty(self, rows, cols):
+        header(cols, "Images", self.scope_text())
+        mid = rows // 2 - 1
+        title = "No images yet"
+        sub = "Images Claude makes, reads or receives appear here."
+        at(mid, max(1, (cols - len(title)) // 2), f"{ACCENT}◇{RESET}  {BOLD}{title}{RESET}")
+        at(mid + 2, max(1, (cols - len(sub)) // 2), f"{MUTED}{trunc(sub, cols - 4, False)}{RESET}")
+        footer(rows, cols, [("q", "quit")])
+
+    def browse_keys(self):
+        keys = [("?", "keys"), ("y", "copy path"), ("o", "open in app")]
+        return keys + [("q", "quit")]
+
+    def grid_layout(self, rows, cols, cw, ch):
+        usable = cols - 2 * MARGIN
+        ncols = max(1, (usable + GUTTER) // (CARD_SIZES[self.thumb_size] + GUTTER))
+        card_w = (usable - GUTTER * (ncols - 1)) // ncols
+        thumb_rows = max(3, round((card_w - 4) * cw * THUMB_RATIO / ch))
+        card_h = thumb_rows + 4      # border, picture, name, facts, border
+        nrows = max(1, (rows - 5 + 1) // (card_h + 1))
+        return ncols, nrows, card_w, card_h, thumb_rows
+
+    def draw_grid(self, rows, cols, cw, ch):
+        ncols, nrows, card_w, card_h, thumb_rows = self.grid_layout(rows, cols, cw, ch)
+        per_page = ncols * nrows
+        self.page_size = ncols
+        n = len(self.items)
+        start = (self.idx // per_page) * per_page
+        page, pages = start // per_page + 1, -(-n // per_page)
+
+        self.top_bar(cols, f"{self.scope_text()} · {n}" + (f" · page {page}/{pages}" if pages > 1 else ""))
+        for k, item in enumerate(self.items[start:start + per_page]):
+            i = start + k
+            sel = i == self.idx
+            r = 4 + (k // ncols) * (card_h + 1)
+            c = MARGIN + 1 + (k % ncols) * (card_w + GUTTER)
+            card(r, c, card_w, card_h, sel)
+            if not draw_picture(item.path, r + 1, c + 2, card_w - 4, thumb_rows, cw, ch, radius=round(cw * 0.8)):
+                at(r + 1 + thumb_rows // 2, c + 2, f"{WARN}{trunc('cannot preview', card_w - 4)}{RESET}")
+            name = trunc(os.path.basename(item.path), card_w - 4)
+            at(r + card_h - 3, c + 2, f"{BOLD}{ACCENT}{name}{RESET}" if sel else name)
+            facts = info(item.path)
+            facts = f"{facts[0]}×{facts[1]} · {ago(item.time)}" if facts else ago(item.time)
+            who = origin(item)
+            at(r + card_h - 2, c + 2, f"{origin_tag(item)}{MUTED} · {trunc(facts, card_w - 7 - len(who), False)}{RESET}")
+            self.hit(r, c, r + card_h - 1, c + card_w - 1, lambda i=i: self.select(i, open_it=True))
+
+        footer(rows, cols, [("←↑→↓", "move")] + self.browse_keys(), f"{self.idx + 1} / {n}")
+
+    def draw_sidebar(self, rows, cols, cw, ch):
+        n = len(self.items)
+        self.page_size = 1
+        self.top_bar(cols, f"{self.scope_text()} · {n}")
+        side_w = self.side_w or max(18, min(30, cols // 4))
+        side_w = max(14, min(side_w, cols // 2))
+        tile_h = max(5, round((side_w - 4) * cw * THUMB_RATIO / ch) + 3)   # border, picture, name, border
+        top, bottom = 4, rows - 2
+        visible = max(1, (bottom - top + 1) // tile_h)
+        first = max(0, min(self.idx - visible // 2, n - visible))
+        for k in range(min(visible, n - first)):
+            i = first + k
+            item = self.items[i]
+            r = top + k * tile_h
+            sel = i == self.idx
+            card(r, MARGIN + 1, side_w, tile_h, sel)
+            draw_picture(item.path, r + 1, MARGIN + 3, side_w - 4, tile_h - 3, cw, ch, radius=round(cw * 0.6))
+            at(r, MARGIN + 3, f" {origin_tag(item)} ")        # a label set into the top border
+            name = trunc(os.path.basename(item.path), side_w - 4)
+            at(r + tile_h - 2, MARGIN + 3, f"{BOLD}{ACCENT}{name}{RESET}" if sel else f"{MUTED}{name}{RESET}")
+            self.hit(r, MARGIN + 1, r + tile_h - 1, MARGIN + side_w, lambda i=i: self.select(i))
+        if first > 0:
+            at(top - 1, MARGIN + side_w // 2, f"{MUTED}▲{RESET}")
+        if first + visible < n:
+            at(bottom, MARGIN + side_w // 2, f"{MUTED}▼{RESET}")
+
+        # The stage: the picked image, its facts and path.
+        left = MARGIN + side_w + 4          # one blank cell, the divider, one blank cell
+        width = cols - MARGIN - left + 1
+        for r in range(top, bottom):
+            at(r, left - 2, f"{FAINT}│{RESET}")
+        item = self.items[self.idx]
+        stage_rows = max(3, bottom - top - 3)
+        if not draw_picture(item.path, top, left, width, stage_rows, cw, ch):
+            at(top + stage_rows // 2, left, f"{WARN}This image cannot be previewed.{RESET}")
+        self.hit(top, left, top + stage_rows - 1, cols - MARGIN, lambda: self.set_mode("single"))
+        at(top + stage_rows + 1, left, f"{BOLD}{trunc(os.path.basename(item.path), width)}{RESET}")
+        at(top + stage_rows + 2, left, f"{MUTED}{trunc(describe(item), width, False)}{RESET}")
+
+        footer(rows, cols, [("↑↓", "move"), ("⏎", "full view")] + self.browse_keys(), f"{self.idx + 1} / {n}")
+
+    def draw_single(self, rows, cols, cw, ch):
+        item = self.items[self.idx]
+        n = len(self.items)
+        self.page_size = 1
+        zoom_text = f" · {round(self.zoom * 100)}% zoom" if self.zoom > 1 else ""
+        self.top_bar(cols, f"{self.idx + 1} of {n}{zoom_text}")
+
+        strip = rows >= 22 and n > 1
+        strip_h = 5 if strip else 0
+        area_top, area_bottom = 4, rows - 4 - (strip_h + 1 if strip else 0)
+        area_rows = max(3, area_bottom - area_top)
+        area_cols = cols - 2 * MARGIN
+        try:
+            v = zoom_view(item.path, int(area_cols * cw), int(area_rows * ch), self.zoom, self.center)
+            top, left, pw, ph = draw_zoomed(item.path, area_top, MARGIN + 1, area_cols, area_rows, cw, ch, v)
+            self.center = (v.cx, v.cy) if self.zoom > 1 else None
+            self.stage = {"view": v, "top": top, "left": left, "pw": pw, "ph": ph, "cw": cw, "ch": ch,
+                          "area_top": area_top, "area_left": MARGIN + 1, "area_cols": area_cols,
+                          "area_rows": area_rows}
+        except Exception:
+            self.stage = None
+            at(area_top + area_rows // 2, MARGIN + 1, f"{WARN}This image cannot be previewed.{RESET}")
+
+        at(area_bottom + 1, MARGIN + 1, f"{MUTED}{trunc(describe(item), cols - 2 * MARGIN, False)}{RESET}")
+        at(area_bottom + 2, MARGIN + 1, f"{FAINT}{trunc(item.path, cols - 2 * MARGIN)}{RESET}")
+
+        if strip:
+            # A filmstrip of neighbours, the current one framed in the accent; click to jump.
+            tile_w = 14
+            count = max(1, min(n, (cols - 2 * MARGIN + GUTTER) // (tile_w + GUTTER)))
+            first = max(0, min(self.idx - count // 2, n - count))
+            total_w = count * tile_w + (count - 1) * GUTTER
+            left = MARGIN + 1 + max(0, (cols - 2 * MARGIN - total_w) // 2)
+            top = rows - 2 - strip_h
+            for k in range(count):
+                i = first + k
+                c = left + k * (tile_w + GUTTER)
+                card(top, c, tile_w, strip_h, i == self.idx)
+                draw_picture(self.items[i].path, top + 1, c + 1, tile_w - 2, strip_h - 2, cw, ch, radius=round(cw * 0.5))
+                self.hit(top, c, top + strip_h - 1, c + tile_w - 1, lambda i=i: self.select(i))
+
+        browsing = SESSION or not POINTER
+        if self.zoom > 1:
+            keys = [("drag ←↑→↓", "pan"), ("+ -", "zoom"), ("0", "fit"), ("esc", "fit"), ("?", "keys"), ("q", "quit")]
+        else:
+            keys = [("←→", "newer / older" if self.newest_first else "older / newer"), ("wheel + -", "zoom"),
+                    ("esc", "back"), ("?", "keys"), ("y", "copy path"), ("o", "open in app"), ("q", "quit")]
+        footer(rows, cols, keys if browsing else [("q", "quit")])
+
+    # input -------------------------------------------------------------------
+    def handle(self, data):
+        """One read from the terminal: graphics replies, mouse reports and/or a key. False quits."""
+        if DEBUG_LOG:
+            debug("input", repr(data[:300]))
+        for m in REPLY.finditer(data):
+            # A failure placing a kept picture (kitty deleted it): send it again next draw.
+            pid = re.search(r"(?:^|,)i=(\d+)", m[1])
+            if pid and not m[2].startswith("OK"):
+                for pic in list(_sent.values()) + [p for p in _png.values() if p]:
+                    if pic.id == int(pid[1]):
+                        pic.sent = False
+                        _sent.pop(pic.id, None)
+                self.dirty = True
+        data = REPLY.sub("", data)
+        for m in MOUSE.finditer(data):
+            button, col, row, kind = int(m[1]), int(m[2]), int(m[3]), m[4]
+            if kind == "m":
+                if self.drag and self.stage_dirty:
+                    self.stage_dirty, self.dirty = False, True   # crisp frame where the drag ended
+                self.drag = None
+                continue
+            in_stage = self.mode == "single" and self.stage is not None and row < term_size()[0] - 8
+            if button in (64, 65) and in_stage:
+                self.zoom_by(1.25 if button == 64 else 1 / 1.25, (row, col))
+            elif button == 64:
+                self.select(self.idx - 1)
+            elif button == 65:
+                self.select(self.idx + 1)
+            elif button == 32 and self.drag and self.zoom > 1:      # left button held, moving
+                r0, c0 = self.drag
+                st = self.stage
+                self.pan((c0 - col) * st["cw"], (r0 - row) * st["ch"])
+                self.drag = (row, col)
+            elif button == 0:
+                self.drag = (row, col) if in_stage and self.zoom > 1 else None
+                if not self.drag:
+                    self.click(row, col)
+        if self.quitting:
+            return False
+        rest = MOUSE.sub("", data)
+        return self.key(rest) if rest else True
+
+    def key(self, k):
+        n = len(self.items)
+        vertical = self.page_size if self.mode == "grid" else 1
+        moves = {"\033[D": -1, "h": -1, "\033[C": 1, "l": 1,
+                 "\033[A": -vertical, "k": -vertical, "\033[B": vertical, "j": vertical}
+        if k in ("q", "\x03"):
+            return False
+        if self.help:
+            self.help, self.dirty = False, True
+            return True
+        if k == "?":
+            self.help, self.dirty = True, True
+        elif k == "y" and n:
+            copy_text(self.items[self.idx].path)
+            self.flash("path copied")
+        elif k == "t":
+            sizes = list(CARD_SIZES)
+            self.thumb_size = sizes[(sizes.index(self.thumb_size) + 1) % len(sizes)]
+            save_prefs(thumbSize=self.thumb_size)
+            self.flash(f"{self.thumb_size} thumbnails")
+        elif k in ("[", "]"):
+            cols = term_size()[1]
+            cur = self.side_w or max(18, min(30, cols // 4))
+            self.side_w = max(14, min(cols // 2, cur + (-3 if k == "[" else 3)))
+            save_prefs(sidebarWidth=self.side_w)
+            if self.mode != "sidebar":
+                self.set_mode("sidebar")
+            self.dirty = True
+        elif k == "r":
+            clear_pictures(forget=True)
+            _png.clear()
+            self.rescan()
+            self.dirty = True
+        elif self.mode == "single" and k in ("+", "="):
+            self.zoom_by(1.5)
+        elif self.mode == "single" and k in ("-", "_"):
+            self.zoom_by(1 / 1.5)
+        elif self.mode == "single" and k == "0":
+            self.zoom, self.center, self.dirty = 1.0, None, True
+        elif self.mode == "single" and self.zoom > 1 and k in moves and self.stage:
+            st = self.stage
+            step_x, step_y = st["pw"] / 4, st["ph"] / 4
+            dx = {"\033[D": -step_x, "h": -step_x, "\033[C": step_x, "l": step_x}.get(k, 0)
+            dy = {"\033[A": -step_y, "k": -step_y, "\033[B": step_y, "j": step_y}.get(k, 0)
+            self.pan(dx, dy)
+        elif n and k in moves:
+            self.select(min(max(self.idx + moves[k], 0), n - 1))
+        elif k in ("\r", "\n") and n:
+            self.back() if self.mode == "single" else self.set_mode("single")
+        elif k == "\033":
+            self.back()
+        elif k in ("1", "2", "3") and (SESSION or not POINTER):
+            self.set_mode(MODES[int(k) - 1])
+        elif k == "v" and (SESSION or not POINTER):
+            self.set_mode(MODES[(MODES.index(self.mode) + 1) % len(MODES)])
+        elif k in ("\033[H", "\033[1~", "g"):
+            self.select(0)
+        elif k in ("\033[F", "\033[4~", "G"):
+            self.select(n - 1)
+        elif k == "s" and n:
+            cur = self.paths[self.idx]
+            self.newest_first = not self.newest_first
+            save_prefs(newestFirst=self.newest_first)
+            self.items.reverse()
+            self.idx = self.paths.index(cur)
+            self.dirty = True
+        elif k == "o" and n:
+            opener = "xdg-open" if sys.platform != "darwin" else "open"
+            subprocess.Popen([opener, self.items[self.idx].path], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+
+
+def main():
+    if not (os.isatty(0) and os.isatty(1)):
+        sys.stderr.write("imgview draws in a terminal pane; run it in kitty, Ghostty or herdr.\n")
+        sys.exit(1)
+    v = Viewer()
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    signal.signal(signal.SIGWINCH, lambda *_: setattr(v, "dirty", True))
+    tty.setcbreak(fd)
+    # alternate screen, hidden cursor, mouse clicks + wheel in SGR encoding
+    w("\033[?1049h\033[?25l\033[?1000h\033[?1002h\033[?1006h")
+    last_scan, last_tick = 0.0, time.time()
+    try:
+        while True:
+            now = time.time()
+            if now - last_scan > 0.7:
+                v.rescan()
+                last_scan = now
+            if now - last_tick > 120:     # keep the "2m ago" labels roughly honest
+                v.dirty, last_tick = True, now
+            if FLASH["text"] and now >= FLASH["until"]:
+                FLASH["text"], v.dirty = "", True
+            if v.dirty:
+                v.dirty = v.stage_dirty = False
+                v.draw()
+                v.last_draw = time.time()
+            elif v.stage_dirty and now - v.last_draw >= 1 / 30:
+                v.stage_dirty = False
+                v.draw_stage()
+                v.last_draw = time.time()
+            wait = 1 / 30 if v.stage_dirty else 0.3
+            try:
+                ready = select.select([fd], [], [], wait)[0]
+            except InterruptedError:
+                continue
+            if ready and not v.handle(os.read(fd, 256).decode(errors="ignore")):
+                break
+    finally:
+        clear_pictures(forget=True)
+        w("\033[?1006l\033[?1002l\033[?1000l\033[?25h\033[?1049l")
+        out.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+if __name__ == "__main__":
+    main()

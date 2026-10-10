@@ -1,0 +1,50 @@
+{
+  "name": "image-log",
+  "version": "0.3.0",
+  "description": "A gallery beside Claude of every image it makes, reads or receives, and the ones you send it. Logs paths only, never copies your files.",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "openOn": {
+      "type": "string",
+      "title": "Open the gallery automatically",
+      "description": "claude: when Claude makes or receives an image (not when you send one). any: on any new image. never: only with /image-log. An open gallery shows every new image either way.",
+      "options": [
+        "claude",
+        "any",
+        "never"
+      ],
+      "default": "claude"
+    },
+    "includeReads": {
+      "type": "boolean",
+      "title": "Log images Claude reads",
+      "description": "Also log image files Claude opens with the Read tool (e.g. your screenshots)",
+      "default": true
+    },
+    "includeSent": {
+      "type": "boolean",
+      "title": "Log images you send",
+      "description": "Also log images you paste or drop into the prompt",
+      "default": true
+    },
+    "galleryPane": {
+      "type": "boolean",
+      "title": "Gallery beside Claude",
+      "description": "Open the image gallery in a herdr pane or kitty split next to Claude instead of Claude's own Images pane. Needs python3 with Pillow; in kitty also allow_remote_control and listen_on.",
+      "default": true
+    }
+  },
+  "license": "MIT",
+  "keywords": [
+    "images",
+    "gallery",
+    "screenshots",
+    "kitty",
+    "herdr"
+  ],
+  "author": {
+    "name": "scholarstree"
+  },
+  "repository": "https://github.com/scholarstree/image-log",
+  "homepage": "https://github.com/scholarstree/image-log"
+}

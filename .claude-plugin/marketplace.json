@@ -1,0 +1,15 @@
+{
+  "name": "image-log",
+  "owner": {
+    "name": "scholarstree"
+  },
+  "plugins": [
+    {
+      "name": "image-log",
+      "source": "./"
+    }
+  ],
+  "metadata": {
+    "description": "image-log: a gallery of every image Claude Code makes, reads or receives"
+  }
+}
