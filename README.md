@@ -10,13 +10,22 @@ Claude saves images in many places: the project folder, a session's temp scratch
 
 ## Install
 
-At the prompt of a Claude Code session in a terminal:
+**In Claude Code**, type this at the prompt (where you talk to Claude), not in a shell:
 
 ```
 /plugin install image-log --marketplace scholarstree/image-log
 ```
 
 Answer `y` to add the marketplace, then pick a scope (user scope runs it in every session).
+
+**Or from your shell** (bash, zsh, …), outside Claude Code:
+
+```sh
+claude plugin marketplace add scholarstree/image-log
+claude plugin install image-log@image-log
+```
+
+Sessions already running pick it up after `/reload-plugins` (typed in Claude Code); new sessions have it straight away.
 
 ## Usage
 
@@ -101,8 +110,17 @@ Everything stays on your machine. The log is a local file of paths and session i
 
 ## Uninstall
 
+In Claude Code:
+
 ```
 /plugin uninstall image-log
+```
+
+Or from your shell:
+
+```sh
+claude plugin uninstall image-log@image-log
+claude plugin marketplace remove image-log
 ```
 
 To remove its log and caches as well, delete `~/.cache/claude-images/`. Your images are not affected.
@@ -117,12 +135,23 @@ To remove its log and caches as well, delete `~/.cache/claude-images/`. Your ima
 
 The gallery (`bin/imgview`) sends pictures afresh on each redraw: kitty and herdr both drop stored pictures when their placements are cleared, so keeping pictures in the terminal is not reliable. Thumbnails are cached in memory and in `~/.cache/claude-images/thumbs/`, so only the sending repeats. `IMGVIEW_DEBUG=<file>` logs each redraw and the terminal's replies.
 
-```
-claude --plugin-dir .                 # run a session with the mod from this folder
+All of these run in your shell, from a clone of this repo:
+
+```sh
+claude --plugin-dir .                 # start a session with the mod loaded from this folder
 claude plugin validate .              # check the manifest and hooks
 claude plugin test .                  # hook helper tests
 python3 -m unittest discover -s tests # gallery tests
 ```
+
+To use your clone in every session instead of the published version, install it from the folder (remove the GitHub install first, as both are named `image-log`):
+
+```sh
+claude plugin marketplace add /path/to/image-log
+claude plugin install image-log@image-log
+```
+
+Claude Code then reads the plugin straight from that folder, so after an edit `/reload-plugins` (in Claude Code) is all it takes.
 
 ## License
 
