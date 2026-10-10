@@ -1,7 +1,7 @@
 {
   "name": "image-log",
   "version": "0.3.0",
-  "description": "A gallery beside Claude of every image it makes, reads or receives, and the ones you send it. Logs paths only, never copies your files.",
+  "description": "An image viewer for Claude Code sessions in the terminal: every image Claude makes, reads or receives, and the ones you send it, in a gallery beside your session. Logs paths only, never copies files.",
   "types": "./types/index.d.ts",
   "userConfig": {
     "openOn": {

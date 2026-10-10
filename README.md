@@ -1,12 +1,12 @@
 # image-log
 
-A gallery of every image Claude Code makes, reads or gets back from a tool, and the ones you send it, without copying a single file.
+**An image viewer for Claude Code sessions in the terminal.** Every image Claude makes, reads or receives, and every one you send it, shows up in a gallery beside your session, without a single file being copied.
 
 <p align="center">
   <img src="docs/gallery-sidebar.png" width="560" alt="The image-log gallery in Sidebar view: thumbnails tagged Claude and You on the left, the selected image large on the right">
 </p>
 
-Claude saves images in many places: the project folder, a session's temp scratchpad, wherever a script writes. Some never touch disk because a tool returns them directly. image-log keeps one log of *pointers* to all of them, recording which project, session and agent each came from, and shows each session's images in a gallery beside it.
+Claude saves images in many places: the project folder, a session's temp scratchpad, wherever a script writes. Some never touch disk because a tool returns them directly. image-log keeps one log of *pointers* to all of them, recording which session and agent each came from, and the viewer shows that session's images in one place, in order, tagged **You** or **Claude**.
 
 ## Install
 

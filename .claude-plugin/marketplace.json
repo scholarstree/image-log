@@ -10,6 +10,6 @@
     }
   ],
   "metadata": {
-    "description": "image-log: a gallery of every image Claude Code makes, reads or receives"
+    "description": "image-log: an image viewer for Claude Code sessions in the terminal"
   }
 }
